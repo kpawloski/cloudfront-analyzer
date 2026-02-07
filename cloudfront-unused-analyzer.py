@@ -16,6 +16,7 @@ Requirements:
 """
 
 import boto3
+import csv
 import json
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any
@@ -664,11 +665,43 @@ Unused Indicators:
                 
             return text_report
 
+    def save_csv_report(self, analyses: List[Dict[str, Any]], filename: str):
+        """Save analysis results to a CSV file."""
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'Distribution ID', 'Domain Name', 'Status', 'Enabled',
+                'Last Modified', 'Comment', 'Price Class', 'Origins Count',
+                'Requests (30d)', 'Bytes Downloaded (30d)',
+                'Total Error Rate %', '4xx Error Rate %', '5xx Error Rate %',
+                'Category', 'Unused Indicators'
+            ])
+            for a in analyses:
+                writer.writerow([
+                    a['id'],
+                    a['domain_name'],
+                    a['status'],
+                    'Yes' if a['enabled'] else 'No',
+                    a['last_modified'],
+                    a.get('comment', ''),
+                    a.get('price_class', ''),
+                    a.get('origins_count', 0),
+                    int(a['metrics']['requests']),
+                    int(a['metrics']['bytes_downloaded']),
+                    f"{a['metrics'].get('total_error_rate', 0):.1f}",
+                    f"{a['metrics'].get('4xx_errors', 0):.1f}",
+                    f"{a['metrics'].get('5xx_errors', 0):.1f}",
+                    self.categorize_distribution(a).replace('_', ' ').title(),
+                    '; '.join(a['unused_indicators']) if a['unused_indicators'] else ''
+                ])
+        print(f"CSV report saved to {filename}")
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze CloudFront distributions for unused/idle instances')
     parser.add_argument('--profile', help='AWS profile name')
     parser.add_argument('--output', choices=['json', 'text'], default='text', help='Output format')
     parser.add_argument('--output-file', help='Output file path (default: stdout)')
+    parser.add_argument('--csv', help='Output CSV report to file')
     parser.add_argument('--days', type=int, default=30, help='Number of days to analyze metrics (default: 30)')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--sample', type=int, help='Only analyze first N distributions (for testing)')
@@ -768,6 +801,9 @@ def main():
             print(f"Report saved to {args.output_file}")
         else:
             print(report)
+        
+        if args.csv:
+            analyzer.save_csv_report(analyses, args.csv)
             
     except Exception as e:
         print(f"Error: {e}")

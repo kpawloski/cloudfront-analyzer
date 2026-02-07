@@ -7,7 +7,7 @@ This script helps identify potentially unused or idle CloudFront distributions b
 - **Traffic Analysis**: Examines CloudWatch metrics over the past 30 days (configurable)
 - **Configuration Review**: Checks distribution status, origins, and settings
 - **Pattern Detection**: Identifies test/staging environments based on naming patterns
-- **Comprehensive Reporting**: Provides detailed analysis in JSON or text format
+- **Comprehensive Reporting**: Provides detailed analysis in JSON, text, or CSV format
 
 ## Usage Indicators
 
@@ -58,6 +58,16 @@ python cloudfront-unused-analyzer.py --profile production
 **JSON output to file:**
 ```bash
 python cloudfront-unused-analyzer.py --output json --output-file unused-distributions.json
+```
+
+**Export results to CSV:**
+```bash
+python cloudfront-unused-analyzer.py --csv cloudfront-report.csv
+```
+
+**Combined text report + CSV export:**
+```bash
+python cloudfront-unused-analyzer.py --output text --csv cloudfront-report.csv
 ```
 
 **Analyze last 60 days:**
@@ -123,6 +133,28 @@ Use this script to:
 - Find test environments that should be cleaned up
 - Locate distributions with minimal traffic that might be consolidated
 - Review disabled distributions that are still incurring costs
+
+## CSV Output
+
+The `--csv` flag produces a spreadsheet-friendly report with these columns:
+
+| Column | Description |
+|--------|-------------|
+| Distribution ID | CloudFront distribution ID |
+| Domain Name | CloudFront domain (e.g., d1234.cloudfront.net) |
+| Status | Deployment status |
+| Enabled | Yes/No |
+| Last Modified | Last configuration change date |
+| Comment | Distribution comment/description |
+| Price Class | CloudFront price class |
+| Origins Count | Number of configured origins |
+| Requests (30d) | Total requests in analysis period |
+| Bytes Downloaded (30d) | Total bytes transferred |
+| Total Error Rate % | Combined 4xx + 5xx error rate |
+| 4xx Error Rate % | Client error rate |
+| 5xx Error Rate % | Server error rate |
+| Category | Classification (e.g., Zero Traffic, High Error Rate) |
+| Unused Indicators | Semicolon-separated list of reasons flagged |
 
 ## Limitations
 

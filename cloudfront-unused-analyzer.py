@@ -18,22 +18,43 @@ Requirements:
 import boto3
 import csv
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import argparse
 import sys
 
+# Retry configuration for CloudWatch API throttling
+MAX_RETRIES = 3
+BASE_BACKOFF_SECONDS = 1.0
+
+
+def _cloudwatch_call_with_retry(func, **kwargs):
+    """Execute a CloudWatch API call with exponential backoff on throttling."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return func(**kwargs)
+        except Exception as e:
+            error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', '')
+            if error_code == 'Throttling' and attempt < MAX_RETRIES - 1:
+                sleep_time = BASE_BACKOFF_SECONDS * (2 ** attempt)
+                time.sleep(sleep_time)
+                continue
+            raise
+
+
 class CloudFrontAnalyzer:
-    def __init__(self, profile_name: str = None):
+    def __init__(self, profile_name: str = None, max_workers: int = 5):
         """Initialize AWS clients"""
         session = boto3.Session(profile_name=profile_name) if profile_name else boto3.Session()
         self.cloudfront = session.client('cloudfront')
         
         # CloudFront metrics are ONLY available in us-east-1
-        # Force CloudWatch client to use us-east-1 regardless of session region
         self.cloudwatch = session.client('cloudwatch', region_name='us-east-1')
         self.cloudwatch_enabled = None
-        self.region = 'us-east-1'  # Always use us-east-1 for CloudFront metrics
+        self.region = 'us-east-1'
+        self.max_workers = max_workers
         
     def get_all_distributions(self) -> List[Dict[str, Any]]:
         """Retrieve all CloudFront distributions"""
@@ -54,7 +75,7 @@ class CloudFrontAnalyzer:
         """Verify CloudWatch metrics access and availability"""
         verification = {
             'cloudwatch_accessible': False,
-            'region_correct': True,  # Always true since we force us-east-1
+            'region_correct': True,
             'metrics_available': False,
             'test_distribution_id': test_distribution_id,
             'errors': [],
@@ -63,10 +84,9 @@ class CloudFrontAnalyzer:
         
         print("✓ Using us-east-1 region for CloudFront metrics (forced)")
         
-        # Test basic CloudWatch access
         try:
-            # Try to list some metrics to verify access
-            response = self.cloudwatch.list_metrics(
+            response = _cloudwatch_call_with_retry(
+                self.cloudwatch.list_metrics,
                 Namespace='AWS/CloudFront'
             )
             verification['cloudwatch_accessible'] = True
@@ -81,20 +101,17 @@ class CloudFrontAnalyzer:
             verification['errors'].append(f"CloudWatch access failed: {e}")
             return verification
         
-        # Test with a specific distribution if provided
         if test_distribution_id:
             try:
-                end_time = datetime.utcnow()
-                start_time = end_time - timedelta(days=7)  # Test with shorter period
+                end_time = datetime.now(timezone.utc)
+                start_time = end_time - timedelta(days=7)
                 
-                response = self.cloudwatch.get_metric_statistics(
+                response = _cloudwatch_call_with_retry(
+                    self.cloudwatch.get_metric_statistics,
                     Namespace='AWS/CloudFront',
                     MetricName='Requests',
                     Dimensions=[
-                        {
-                            'Name': 'DistributionId',
-                            'Value': test_distribution_id
-                        }
+                        {'Name': 'DistributionId', 'Value': test_distribution_id}
                     ],
                     StartTime=start_time,
                     EndTime=end_time,
@@ -126,14 +143,11 @@ class CloudFrontAnalyzer:
         }
         
         try:
-            # Check what metrics are available for this distribution
-            response = self.cloudwatch.list_metrics(
+            response = _cloudwatch_call_with_retry(
+                self.cloudwatch.list_metrics,
                 Namespace='AWS/CloudFront',
                 Dimensions=[
-                    {
-                        'Name': 'DistributionId',
-                        'Value': distribution_id
-                    }
+                    {'Name': 'DistributionId', 'Value': distribution_id}
                 ]
             )
             
@@ -141,19 +155,16 @@ class CloudFrontAnalyzer:
                 check_result['has_any_metrics'] = True
                 check_result['available_metrics'] = [m['MetricName'] for m in response['Metrics']]
                 
-                # Check for recent data (last 7 days)
-                end_time = datetime.utcnow()
+                end_time = datetime.now(timezone.utc)
                 start_time = end_time - timedelta(days=7)
                 
                 try:
-                    metrics_response = self.cloudwatch.get_metric_statistics(
+                    metrics_response = _cloudwatch_call_with_retry(
+                        self.cloudwatch.get_metric_statistics,
                         Namespace='AWS/CloudFront',
                         MetricName='Requests',
                         Dimensions=[
-                            {
-                                'Name': 'DistributionId',
-                                'Value': distribution_id
-                            }
+                            {'Name': 'DistributionId', 'Value': distribution_id}
                         ],
                         StartTime=start_time,
                         EndTime=end_time,
@@ -163,9 +174,8 @@ class CloudFrontAnalyzer:
                     
                     if metrics_response['Datapoints']:
                         check_result['has_recent_metrics'] = True
-                        # Find the most recent datapoint
                         latest_point = max(metrics_response['Datapoints'], key=lambda x: x['Timestamp'])
-                        age = (datetime.utcnow().replace(tzinfo=latest_point['Timestamp'].tzinfo) - latest_point['Timestamp']).days
+                        age = (datetime.now(timezone.utc) - latest_point['Timestamp'].replace(tzinfo=timezone.utc)).days
                         check_result['metrics_age_days'] = age
                         
                 except Exception as e:
@@ -175,70 +185,7 @@ class CloudFrontAnalyzer:
             check_result['errors'].append(f"Error listing metrics: {e}")
         
         return check_result
-    
-    def check_distribution_metrics_enabled(self, distribution_id: str) -> Dict[str, Any]:
-        """Check if metrics are enabled/available for a specific distribution"""
-        check_result = {
-            'distribution_id': distribution_id,
-            'has_recent_metrics': False,
-            'has_any_metrics': False,
-            'metrics_age_days': None,
-            'available_metrics': [],
-            'errors': []
-        }
-        
-        try:
-            # Check what metrics are available for this distribution
-            response = self.cloudwatch.list_metrics(
-                Namespace='AWS/CloudFront',
-                Dimensions=[
-                    {
-                        'Name': 'DistributionId',
-                        'Value': distribution_id
-                    }
-                ]
-            )
-            
-            if response['Metrics']:
-                check_result['has_any_metrics'] = True
-                check_result['available_metrics'] = [m['MetricName'] for m in response['Metrics']]
-                
-                # Check for recent data (last 7 days)
-                end_time = datetime.utcnow()
-                start_time = end_time - timedelta(days=7)
-                
-                try:
-                    metrics_response = self.cloudwatch.get_metric_statistics(
-                        Namespace='AWS/CloudFront',
-                        MetricName='Requests',
-                        Dimensions=[
-                            {
-                                'Name': 'DistributionId',
-                                'Value': distribution_id
-                            }
-                        ],
-                        StartTime=start_time,
-                        EndTime=end_time,
-                        Period=86400,
-                        Statistics=['Sum']
-                    )
-                    
-                    if metrics_response['Datapoints']:
-                        check_result['has_recent_metrics'] = True
-                        # Find the most recent datapoint
-                        latest_point = max(metrics_response['Datapoints'], key=lambda x: x['Timestamp'])
-                        age = (datetime.utcnow().replace(tzinfo=latest_point['Timestamp'].tzinfo) - latest_point['Timestamp']).days
-                        check_result['metrics_age_days'] = age
-                        
-                except Exception as e:
-                    check_result['errors'].append(f"Error checking recent metrics: {e}")
-            
-        except Exception as e:
-            check_result['errors'].append(f"Error listing metrics: {e}")
-        
-        return check_result
-    
-    
+
     def get_distribution_metrics(self, distribution_id: str, days: int = 30, debug: bool = False) -> Dict[str, Any]:
         """Get CloudWatch metrics for a distribution over specified days"""
         end_time = datetime.now(timezone.utc)
@@ -259,15 +206,13 @@ class CloudFrontAnalyzer:
         if debug:
             print(f"  Querying metrics from {start_time} to {end_time}")
         
-        # First, get the exact dimensions that CloudWatch knows about
+        # Get the exact dimensions that CloudWatch knows about
         try:
-            list_response = self.cloudwatch.list_metrics(
+            list_response = _cloudwatch_call_with_retry(
+                self.cloudwatch.list_metrics,
                 Namespace='AWS/CloudFront',
                 Dimensions=[
-                    {
-                        'Name': 'DistributionId',
-                        'Value': distribution_id
-                    }
+                    {'Name': 'DistributionId', 'Value': distribution_id}
                 ]
             )
             
@@ -275,21 +220,19 @@ class CloudFrontAnalyzer:
                 if debug:
                     print(f"  No metrics found for distribution {distribution_id}")
                 return metrics
-                
-            # Find the Requests metric and use its exact dimensions
-            requests_metric = None
-            for metric in list_response['Metrics']:
-                if metric['MetricName'] == 'Requests':
-                    requests_metric = metric
-                    break
             
-            if not requests_metric:
+            # Build a lookup of metric name -> dimensions for quick access
+            metric_lookup = {}
+            for metric in list_response['Metrics']:
+                metric_lookup[metric['MetricName']] = metric['Dimensions']
+                
+            if 'Requests' not in metric_lookup:
                 if debug:
                     print(f"  No Requests metric found for distribution {distribution_id}")
                 return metrics
             
             if debug:
-                print(f"  Found Requests metric with dimensions: {requests_metric['Dimensions']}")
+                print(f"  Found metrics: {list(metric_lookup.keys())}")
             
         except Exception as e:
             error_msg = f"Could not list metrics for {distribution_id}: {e}"
@@ -298,12 +241,13 @@ class CloudFrontAnalyzer:
                 print(f"  Error: {error_msg}")
             return metrics
         
-        # Now get the actual metric data using the exact dimensions
+        # Fetch Requests metric
         try:
-            response = self.cloudwatch.get_metric_statistics(
+            response = _cloudwatch_call_with_retry(
+                self.cloudwatch.get_metric_statistics,
                 Namespace='AWS/CloudFront',
                 MetricName='Requests',
-                Dimensions=requests_metric['Dimensions'],  # Use exact dimensions from list_metrics
+                Dimensions=metric_lookup['Requests'],
                 StartTime=start_time,
                 EndTime=end_time,
                 Period=86400,
@@ -316,9 +260,8 @@ class CloudFrontAnalyzer:
                 metrics['requests'] = sum(point['Sum'] for point in response['Datapoints'])
                 if debug:
                     print(f"  Found {len(response['Datapoints'])} datapoints for requests: {metrics['requests']}")
-            else:
-                if debug:
-                    print(f"  No datapoints found for requests metric")
+            elif debug:
+                print(f"  No datapoints found for requests metric")
                     
         except Exception as e:
             error_msg = f"Could not fetch Requests for {distribution_id}: {e}"
@@ -326,19 +269,14 @@ class CloudFrontAnalyzer:
             if debug:
                 print(f"  Error: {error_msg}")
         
-        # Try BytesDownloaded with the same approach
-        try:
-            bytes_metric = None
-            for metric in list_response['Metrics']:
-                if metric['MetricName'] == 'BytesDownloaded':
-                    bytes_metric = metric
-                    break
-            
-            if bytes_metric:
-                response = self.cloudwatch.get_metric_statistics(
+        # Fetch BytesDownloaded if available
+        if 'BytesDownloaded' in metric_lookup:
+            try:
+                response = _cloudwatch_call_with_retry(
+                    self.cloudwatch.get_metric_statistics,
                     Namespace='AWS/CloudFront',
                     MetricName='BytesDownloaded',
-                    Dimensions=bytes_metric['Dimensions'],
+                    Dimensions=metric_lookup['BytesDownloaded'],
                     StartTime=start_time,
                     EndTime=end_time,
                     Period=86400,
@@ -350,55 +288,48 @@ class CloudFrontAnalyzer:
                     if debug:
                         print(f"  BytesDownloaded: {metrics['bytes_downloaded']}")
                         
-        except Exception as e:
-            error_msg = f"Could not fetch BytesDownloaded for {distribution_id}: {e}"
-            metrics['errors'].append(error_msg)
-            if debug:
-                print(f"  Error: {error_msg}")
+            except Exception as e:
+                error_msg = f"Could not fetch BytesDownloaded for {distribution_id}: {e}"
+                metrics['errors'].append(error_msg)
+                if debug:
+                    print(f"  Error: {error_msg}")
         
-        # Try error rate metrics with the same approach
-        error_metrics = ['4xxErrorRate', '5xxErrorRate', 'TotalErrorRate']
+        # Fetch error rate metrics
+        error_metric_map = {
+            '4xxErrorRate': '4xx_errors',
+            '5xxErrorRate': '5xx_errors',
+            'TotalErrorRate': 'total_error_rate',
+        }
         
-        for error_metric_name in error_metrics:
+        for metric_name, metrics_key in error_metric_map.items():
+            if metric_name not in metric_lookup:
+                continue
             try:
-                error_metric = None
-                for metric in list_response['Metrics']:
-                    if metric['MetricName'] == error_metric_name:
-                        error_metric = metric
-                        break
+                response = _cloudwatch_call_with_retry(
+                    self.cloudwatch.get_metric_statistics,
+                    Namespace='AWS/CloudFront',
+                    MetricName=metric_name,
+                    Dimensions=metric_lookup[metric_name],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=86400,
+                    Statistics=['Average']
+                )
                 
-                if error_metric:
-                    response = self.cloudwatch.get_metric_statistics(
-                        Namespace='AWS/CloudFront',
-                        MetricName=error_metric_name,
-                        Dimensions=error_metric['Dimensions'],
-                        StartTime=start_time,
-                        EndTime=end_time,
-                        Period=86400,
-                        Statistics=['Average']
-                    )
-                    
-                    if response['Datapoints']:
-                        avg_error_rate = sum(point['Average'] for point in response['Datapoints']) / len(response['Datapoints'])
-                        
-                        if error_metric_name == '4xxErrorRate':
-                            metrics['4xx_errors'] = avg_error_rate
-                        elif error_metric_name == '5xxErrorRate':
-                            metrics['5xx_errors'] = avg_error_rate
-                        elif error_metric_name == 'TotalErrorRate':
-                            metrics['total_error_rate'] = avg_error_rate
-                            
-                        if debug:
-                            print(f"  {error_metric_name}: {avg_error_rate:.2f}%")
+                if response['Datapoints']:
+                    avg_error_rate = sum(point['Average'] for point in response['Datapoints']) / len(response['Datapoints'])
+                    metrics[metrics_key] = avg_error_rate
+                    if debug:
+                        print(f"  {metric_name}: {avg_error_rate:.2f}%")
                             
             except Exception as e:
-                error_msg = f"Could not fetch {error_metric_name} for {distribution_id}: {e}"
+                error_msg = f"Could not fetch {metric_name} for {distribution_id}: {e}"
                 metrics['errors'].append(error_msg)
                 if debug:
                     print(f"  Error: {error_msg}")
                 
         return metrics
-    
+
     def analyze_distribution(self, distribution: Dict[str, Any], debug: bool = False) -> Dict[str, Any]:
         """Analyze a single distribution for usage patterns"""
         dist_id = distribution['Id']
@@ -442,13 +373,12 @@ class CloudFrontAnalyzer:
             print(f"  Requests: {metrics['requests']}, Has data: {metrics.get('has_data', False)}")
             print(f"  Datapoints found: {metrics.get('datapoints_found', 0)}")
         
-        # Check for unused indicators with more aggressive detection
+        # Check for unused indicators
         if not analysis['enabled']:
             analysis['unused_indicators'].append('Distribution is disabled')
             if debug:
                 print(f"  -> UNUSED: Distribution is disabled")
             
-        # If we have no CloudWatch data at all, it might be unused
         if not metrics.get('has_data', False):
             analysis['unused_indicators'].append('No CloudWatch metrics data available (likely no traffic)')
             if debug:
@@ -470,7 +400,7 @@ class CloudFrontAnalyzer:
         # Check if distribution is old and unused
         try:
             last_modified = datetime.fromisoformat(analysis['last_modified'].replace('Z', '+00:00'))
-            days_since_modified = (datetime.now(last_modified.tzinfo) - last_modified).days
+            days_since_modified = (datetime.now(timezone.utc) - last_modified).days
             
             if days_since_modified > 90 and metrics['requests'] < 10:
                 analysis['unused_indicators'].append(f'Not modified in {days_since_modified} days with minimal traffic')
@@ -488,17 +418,17 @@ class CloudFrontAnalyzer:
         for pattern in test_patterns:
             if pattern in domain_lower or pattern in comment_lower:
                 analysis['unused_indicators'].append(f'Appears to be test/staging environment (contains "{pattern}")')
+                analysis['_is_test_env'] = True
                 if debug:
                     print(f"  -> UNUSED: Test environment pattern '{pattern}' found")
                 break
         
-        # Additional checks for potentially unused distributions
         if analysis['status'] != 'Deployed':
             analysis['unused_indicators'].append(f'Distribution status is {analysis["status"]} (not Deployed)')
             if debug:
                 print(f"  -> UNUSED: Status is {analysis['status']}")
         
-        # Check for high error rates (strong indicator of unused/broken distributions)
+        # Check for high error rates
         total_error_rate = metrics.get('total_error_rate', 0)
         error_4xx = metrics.get('4xx_errors', 0)
         error_5xx = metrics.get('5xx_errors', 0)
@@ -506,7 +436,6 @@ class CloudFrontAnalyzer:
         if debug:
             print(f"  Error rates - Total: {total_error_rate:.1f}%, 4xx: {error_4xx:.1f}%, 5xx: {error_5xx:.1f}%")
         
-        # High error rate thresholds
         if total_error_rate >= 100:
             analysis['unused_indicators'].append(f'100% error rate - distribution is completely broken')
             if debug:
@@ -520,7 +449,6 @@ class CloudFrontAnalyzer:
             if debug:
                 print(f"  -> UNUSED: High error rate ({total_error_rate:.1f}%)")
         
-        # Check for specific error patterns
         if error_5xx >= 50:
             analysis['unused_indicators'].append(f'High 5xx error rate: {error_5xx:.1f}% - server errors indicate broken origin')
             if debug:
@@ -528,7 +456,6 @@ class CloudFrontAnalyzer:
         
         # Check for distributions with only errors (no successful requests)
         if metrics['requests'] > 0 and total_error_rate > 0:
-            # Calculate approximate successful requests
             error_rate_decimal = total_error_rate / 100
             estimated_errors = metrics['requests'] * error_rate_decimal
             estimated_success = metrics['requests'] - estimated_errors
@@ -542,63 +469,101 @@ class CloudFrontAnalyzer:
             print(f"  Total unused indicators: {len(analysis['unused_indicators'])}")
                 
         return analysis
-    
+
     def categorize_distribution(self, analysis: Dict[str, Any]) -> str:
-        """Categorize a distribution based on its usage patterns"""
+        """Categorize a distribution based on its analysis results.
+        
+        Uses existing unused_indicators and flags from analyze_distribution
+        instead of re-checking patterns.
+        """
         metrics = analysis['metrics']
         
-        # Check if disabled
         if not analysis['enabled']:
             return 'disabled'
         
-        # Check for completely broken (100% error rate)
         if metrics.get('total_error_rate', 0) >= 100:
             return 'completely_broken'
         
-        # Check for high error rate (50-99%)
         if metrics.get('total_error_rate', 0) >= 50:
             return 'high_error_rate'
         
-        # Check for zero traffic
         if metrics['requests'] == 0:
             return 'zero_traffic'
         
-        # Check for low traffic
         if metrics['requests'] < 100:
             return 'low_traffic'
         
-        # Check for test/staging environment
-        test_patterns = ['test', 'staging', 'dev', 'demo', 'temp', 'poc', 'prototype', 'sandbox']
-        domain_lower = analysis['domain_name'].lower()
-        comment_lower = analysis['comment'].lower()
+        # Use the flag set during analyze_distribution instead of re-scanning
+        if analysis.get('_is_test_env', False):
+            return 'test_environment'
         
-        for pattern in test_patterns:
-            if pattern in domain_lower or pattern in comment_lower:
-                return 'test_environment'
-        
-        # Check if it has unused indicators but doesn't fit other categories
         if analysis['unused_indicators']:
             return 'other_unused'
         
-        # Otherwise it's active
         return 'active'
     
+    def analyze_distributions_parallel(self, distributions: List[Dict[str, Any]], debug: bool = False) -> List[Dict[str, Any]]:
+        """Analyze multiple distributions in parallel using a thread pool."""
+        analyses = []
+        total = len(distributions)
+        
+        if debug:
+            # Run sequentially in debug mode so output is readable
+            for i, dist in enumerate(distributions, 1):
+                print(f"Analyzing distribution {i}/{total}: {dist['Id']}")
+                analysis = self.analyze_distribution(dist, debug=debug)
+                analyses.append(analysis)
+                if analysis['unused_indicators']:
+                    print(f"  FOUND UNUSED: {len(analysis['unused_indicators'])} indicators")
+            return analyses
+        
+        completed = 0
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_dist = {
+                executor.submit(self.analyze_distribution, dist, False): dist
+                for dist in distributions
+            }
+            
+            for future in as_completed(future_to_dist):
+                dist = future_to_dist[future]
+                completed += 1
+                try:
+                    analysis = future.result()
+                    analyses.append(analysis)
+                    status = f"UNUSED ({len(analysis['unused_indicators'])} indicators)" if analysis['unused_indicators'] else "OK"
+                    print(f"  [{completed}/{total}] {dist['Id']} - {status}")
+                except Exception as e:
+                    print(f"  [{completed}/{total}] {dist['Id']} - ERROR: {e}")
+                    # Create a minimal failed analysis so the report still includes it
+                    analyses.append({
+                        'id': dist['Id'],
+                        'domain_name': dist.get('DomainName', 'unknown'),
+                        'status': dist.get('Status', 'unknown'),
+                        'enabled': dist.get('Enabled', True),
+                        'last_modified': dist.get('LastModifiedTime', datetime.now(timezone.utc)).isoformat(),
+                        'metrics': {'requests': 0, 'bytes_downloaded': 0, 'bytes_uploaded': 0,
+                                    '4xx_errors': 0, '5xx_errors': 0, 'total_error_rate': 0,
+                                    'has_data': False, 'datapoints_found': 0, 'errors': [str(e)]},
+                        'origins_count': 0,
+                        'price_class': dist.get('PriceClass', 'Unknown'),
+                        'comment': dist.get('Comment', ''),
+                        'unused_indicators': [f'Analysis failed: {e}']
+                    })
+        
+        return analyses
+
     def generate_report(self, analyses: List[Dict[str, Any]], output_format: str = 'json') -> str:
         """Generate a report of the analysis"""
-        # Separate unused from active distributions
         unused_distributions = [a for a in analyses if a['unused_indicators']]
         active_distributions = [a for a in analyses if not a['unused_indicators']]
         
-        # Categorize all distributions
         categorized = {}
         for analysis in analyses:
             category = self.categorize_distribution(analysis)
-            if category not in categorized:
-                categorized[category] = []
-            categorized[category].append(analysis)
+            categorized.setdefault(category, []).append(analysis)
         
         report = {
-            'analysis_date': datetime.utcnow().isoformat(),
+            'analysis_date': datetime.now(timezone.utc).isoformat(),
             'total_distributions': len(analyses),
             'potentially_unused': len(unused_distributions),
             'active_distributions': len(active_distributions),
@@ -610,15 +575,15 @@ class CloudFrontAnalyzer:
                 'low_traffic_count': len([a for a in analyses if 0 < a['metrics']['requests'] < 100]),
                 'high_error_rate_count': len([a for a in analyses if 50 <= a['metrics'].get('total_error_rate', 0) < 100]),
                 'completely_broken_count': len([a for a in analyses if a['metrics'].get('total_error_rate', 0) >= 100]),
-                'test_env_count': len([a for a in analyses if any('test' in indicator.lower() or 'staging' in indicator.lower() for indicator in a['unused_indicators'])]),
-                'categories': {category: len(distributions) for category, distributions in categorized.items()}
+                'test_env_count': len([a for a in analyses if a.get('_is_test_env', False)]),
+                'categories': {category: len(dists) for category, dists in categorized.items()}
             }
         }
         
         if output_format == 'json':
             return json.dumps(report, indent=2, default=str)
-        else:
-            text_report = f"""
+        
+        text_report = f"""
 CloudFront Distribution Usage Analysis
 =====================================
 Analysis Date: {report['analysis_date']}
@@ -636,19 +601,18 @@ Summary:
 
 Distribution Categories:
 """
-            
-            # Add category breakdown
-            for category, count in report['summary']['categories'].items():
-                category_name = category.replace('_', ' ').title()
-                text_report += f"- {category_name}: {count}\n"
-            
-            text_report += f"""
+        
+        for category, count in report['summary']['categories'].items():
+            category_name = category.replace('_', ' ').title()
+            text_report += f"- {category_name}: {count}\n"
+        
+        text_report += f"""
 Potentially Unused Distributions:
 ================================
 """
-            
-            for dist in unused_distributions:
-                text_report += f"""
+        
+        for dist in unused_distributions:
+            text_report += f"""
 Distribution ID: {dist['id']}
 Domain: {dist['domain_name']}
 Status: {dist['status']} | Enabled: {dist['enabled']}
@@ -659,11 +623,11 @@ Error Rates: Total: {dist['metrics'].get('total_error_rate', 0):.1f}%, 4xx: {dis
 Category: {self.categorize_distribution(dist).replace('_', ' ').title()}
 Unused Indicators:
 """
-                for indicator in dist['unused_indicators']:
-                    text_report += f"  - {indicator}\n"
-                text_report += "-" * 50 + "\n"
-                
-            return text_report
+            for indicator in dist['unused_indicators']:
+                text_report += f"  - {indicator}\n"
+            text_report += "-" * 50 + "\n"
+            
+        return text_report
 
     def save_csv_report(self, analyses: List[Dict[str, Any]], filename: str):
         """Save analysis results to a CSV file."""
@@ -696,6 +660,7 @@ Unused Indicators:
                 ])
         print(f"CSV report saved to {filename}")
 
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze CloudFront distributions for unused/idle instances')
     parser.add_argument('--profile', help='AWS profile name')
@@ -703,33 +668,32 @@ def main():
     parser.add_argument('--output-file', help='Output file path (default: stdout)')
     parser.add_argument('--csv', help='Output CSV report to file')
     parser.add_argument('--days', type=int, default=30, help='Number of days to analyze metrics (default: 30)')
-    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output (disables parallel analysis)')
     parser.add_argument('--sample', type=int, help='Only analyze first N distributions (for testing)')
     parser.add_argument('--broken', action='store_true', help='Only output distribution IDs with 100%% error rates (one per line)')
+    parser.add_argument('--test-dist', help='Distribution ID to use for CloudWatch verification (default: first found)')
+    parser.add_argument('--workers', type=int, default=5, help='Number of parallel workers for analysis (default: 5)')
     
     args = parser.parse_args()
     
     try:
-        analyzer = CloudFrontAnalyzer(profile_name=args.profile)
+        analyzer = CloudFrontAnalyzer(profile_name=args.profile, max_workers=args.workers)
+        
+        print("Fetching CloudFront distributions...")
+        distributions = analyzer.get_all_distributions()
+        
+        if not distributions:
+            print("No CloudFront distributions found or unable to access them.", file=sys.stderr)
+            sys.exit(1)
         
         # Skip CloudWatch verification if we're just looking for broken distributions
         if not args.broken:
             print("Verifying CloudWatch access...")
-            
-            # First, get a sample distribution for testing
-            print("Fetching CloudFront distributions...")
-            distributions = analyzer.get_all_distributions()
-            
-            if not distributions:
-                print("No CloudFront distributions found or unable to access them.")
-                sys.exit(1)
-            
-            # Verify CloudWatch access with a known distribution that has traffic
-            test_dist_id = "E2SG8ZFUZOH8GZ"  # Known distribution with traffic
-            print(f"Testing CloudWatch access with known active distribution: {test_dist_id}")
+            # Use CLI arg, or fall back to first distribution
+            test_dist_id = args.test_dist or distributions[0]['Id']
+            print(f"Testing CloudWatch access with distribution: {test_dist_id}")
             verification = analyzer.verify_cloudwatch_access(test_dist_id)
             
-            # Print verification results
             if verification['errors']:
                 print("❌ CloudWatch Verification Issues:")
                 for error in verification['errors']:
@@ -743,13 +707,6 @@ def main():
             if not verification['cloudwatch_accessible']:
                 print("❌ Cannot access CloudWatch metrics. Analysis may be incomplete.")
                 print("Please check your AWS permissions and region settings.")
-        else:
-            # For --broken mode, just get distributions without verification
-            distributions = analyzer.get_all_distributions()
-            
-            if not distributions:
-                print("No CloudFront distributions found or unable to access them.", file=sys.stderr)
-                sys.exit(1)
         
         if args.sample:
             distributions = distributions[:args.sample]
@@ -759,37 +716,14 @@ def main():
             if not args.broken:
                 print(f"Found {len(distributions)} distributions. Analyzing...")
         
-        analyses = []
-        broken_distribution_ids = []
-        
-        for i, dist in enumerate(distributions, 1):
-            if not args.broken:
-                print(f"Analyzing distribution {i}/{len(distributions)}: {dist['Id']}")
-            
-            # Check metrics availability for this distribution if in debug mode
-            if args.debug and not args.broken:
-                metrics_check = analyzer.check_distribution_metrics_enabled(dist['Id'])
-                if not metrics_check['has_any_metrics']:
-                    print(f"  ⚠️  No CloudWatch metrics found for this distribution")
-                elif not metrics_check['has_recent_metrics']:
-                    print(f"  ⚠️  No recent metrics (last 7 days) for this distribution")
-            
-            analysis = analyzer.analyze_distribution(dist, debug=args.debug and not args.broken)
-            analyses.append(analysis)
-            
-            # Check if this distribution is completely broken (100% error rate)
-            if analysis['metrics'].get('total_error_rate', 0) >= 100:
-                broken_distribution_ids.append(dist['Id'])
-            
-            if args.debug and not args.broken and analysis['unused_indicators']:
-                print(f"  FOUND UNUSED: {len(analysis['unused_indicators'])} indicators")
+        # Use parallel analysis (falls back to sequential in debug mode)
+        analyses = analyzer.analyze_distributions_parallel(distributions, debug=args.debug and not args.broken)
         
         # Handle --broken flag output
         if args.broken:
-            if broken_distribution_ids:
-                for dist_id in broken_distribution_ids:
-                    print(dist_id)
-            # Exit without generating full report
+            broken_ids = [a['id'] for a in analyses if a['metrics'].get('total_error_rate', 0) >= 100]
+            for dist_id in broken_ids:
+                print(dist_id)
             sys.exit(0)
         
         print("Generating report...")
